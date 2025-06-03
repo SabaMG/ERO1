@@ -106,7 +106,7 @@ def minimum_weight_matching(odd_nodes: list, dist: dict):
     # Construit PyGraph avec nœuds [0..m-1]
     m = len(odd_nodes)
     g = rx.PyGraph()
-    g.extend_from_node_list(range(m))
+    g.add_nodes_from(list(range(m)))
 
     # Ajoute les arêtes avec poids négatif
     for i in range(m):
@@ -163,14 +163,22 @@ def main():
 
     # 3) Duplication & extraction du circuit
     G_euler = duplicate_edges(G_und, pairs)
-    circuit = extract_eulerian_circuit(G_euler)
-    print(f"Circuit eulérien généré : {len(circuit)} arêtes au total")
+    circuit_edges = extract_eulerian_circuit(G_euler)
+    print(f"Circuit eulérien généré : {len(circuit_edges)              } arêtes au total")
 
-    # 4) Affichage final du circuit
-    # on crée un sous-raphe orienté pour tracer le parcours
-    H = nx.DiGraph()
-    H.add_edges_from(circuit)
-    plot_graph(H, show=True)
+    nodes_route = [circuit_edges[0][0]]
+    for (u, v) in circuit_edges:
+        nodes_route.append(v)
 
+    # 6.8) Affichage final du circuit sur le graphe original
+    print("-- plotting eulerian route --")
+    fig1, ax1 = ox.plot_graph_route(
+        G_und,
+        nodes_route,
+        route_linewidth=2,
+        node_size=0,
+        bgcolor="w"
+    )
+    plt.show()
 if __name__ == "__main__":
     main()
