@@ -129,19 +129,40 @@ def build_eulerian_routes(G, nI, nII, max_hours):
 
 
 # -----------------------------------------------
-# 4) Tracé manuel avec Matplotlib (aucun GeoPandas)
+# 4) Tracé manuel avec Matplotlib + affichage du temps
 # -----------------------------------------------
-def plot_network_and_route(G, route_edges, color, title):
+def plot_network_and_route_with_time(G, route_edges, type_machine, title):
     """
     Trace le sous-graphe d'OSMnx G en gris clair, puis surcouche l'itinéraire
-    donné sous forme de route_edges = [(u,v), ...] en couleur 'color'.
-    'title' sert pour le titre de la figure.
+    donné sous forme de route_edges = [(u,v), ...] en couleur selon type_machine.
+    Affiche en console la distance totale et le temps nécessaire.
     """
     U = (
         G.to_undirected()
     )  # MultiGraph non orienté, conserve 'length' et éventuellement 'geometry'
 
-    # 1) Dessiner le fond : toutes les arêtes du réseau en gris léger
+    # 1) Calculer la distance totale de cette route (en km)
+    total_dist_km = 0.0
+    for u, v in route_edges:
+        longueur_m = U[u][v][0]["length"]
+        total_dist_km += longueur_m / 1000.0
+
+    # 2) Déterminer la vitesse selon le type (I = 10 km/h, II = 20 km/h) et calculer le temps
+    if type_machine == "I":
+        speed = 10.0
+        color = "blue"
+    else:
+        speed = 20.0
+        color = "red"
+    time_hours = total_dist_km / speed
+
+    # 3) Afficher en console
+    print(
+        f"    • Distance de l'itinéraire Type {type_machine} : {total_dist_km:.2f} km"
+    )
+    print(f"      → Temps estimé à {speed:.0f} km/h : {time_hours:.2f} heures\n")
+
+    # 4) Dessiner le fond : toutes les arêtes du réseau en gris léger
     fig, ax = plt.subplots(figsize=(8, 8))
     for u, v, data in U.edges(data=True):
         if "geometry" in data:
@@ -152,11 +173,11 @@ def plot_network_and_route(G, route_edges, color, title):
             x2, y2 = U.nodes[v]["x"], U.nodes[v]["y"]
             ax.plot([x1, x2], [y1, y2], linewidth=0.4, color="lightgray", zorder=1)
 
-    # 2) Dessiner la route de la machine en surcouche
+    # 5) Dessiner la route de la machine en surcouche
     for u, v in route_edges:
         data = U.get_edge_data(u, v)
         if data is None:
-            # si l'arête n'existe pas tel quel, on la trace à la main
+            # si l'arête n'existe pas tel quel (rare), on trace un segment direct
             x1, y1 = U.nodes[u]["x"], U.nodes[u]["y"]
             x2, y2 = U.nodes[v]["x"], U.nodes[v]["y"]
             ax.plot([x1, x2], [y1, y2], linewidth=1.8, color=color, zorder=2)
@@ -215,24 +236,33 @@ def main():
 
             print(f"  • Distance du réseau : {total_km:.2f} km")
             print(
-                f"  • Flotte optimale → {best_nI} I + {best_nII} II → {best_cost:.2f} $\n"
+                f"  • Flotte optimale → {best_nI} machine(s) Type I + {best_nII} machine(s) Type II"
             )
+            print(f"    Coût global estimé = {best_cost:.2f} $\n")
 
             # 4) Générer les itinéraires
             routes_I, routes_II = build_eulerian_routes(G, best_nI, best_nII, max_hours)
 
-            # 5) Tracer la ou les machines Type I en bleu
+            # 5) Pour chaque machine Type I, afficher distance et temps, puis tracer
             if best_nI > 0:
                 for idx, r in enumerate(routes_I, start=1):
-                    plot_network_and_route(
-                        G, r, color="blue", title=f"Itinéraire Machine I#{idx} → {name}"
+                    print(f"  ── Machine I#{idx} ──")
+                    plot_network_and_route_with_time(
+                        G,
+                        r,
+                        type_machine="I",
+                        title=f"Itinéraire Machine I#{idx} → {name}",
                     )
 
-            # 6) Tracer la ou les machines Type II en rouge
+            # 6) Pour chaque machine Type II, afficher distance et temps, puis tracer
             if best_nII > 0:
                 for idx, r in enumerate(routes_II, start=1):
-                    plot_network_and_route(
-                        G, r, color="red", title=f"Itinéraire Machine II#{idx} → {name}"
+                    print(f"  ── Machine II#{idx} ──")
+                    plot_network_and_route_with_time(
+                        G,
+                        r,
+                        type_machine="II",
+                        title=f"Itinéraire Machine II#{idx} → {name}",
                     )
 
             print("\n")
