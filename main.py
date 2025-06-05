@@ -145,6 +145,44 @@ def extract_eulerian_circuit(G_euler: nx.MultiGraph):
     assert nx.is_eulerian(G_euler), "Le graphe n'est pas eulérien !"
     return list(nx.eulerian_circuit(G_euler))
 
+def compute_survol_cost(G_und, G_euler, circuit_edges):
+    """
+    G_und : graphe routier original, dont chaque arête G_und.edges[u,v]['length']
+            est la longueur en mètres
+    G_euler : MultiGraph eulérien contenant les duplications
+    circuit_edges : liste retournée par nx.eulerian_circuit(G_euler),
+                    chaque élément peut être (u, v) ou (u, v, key)
+    """
+    # 1) Calculer la distance totale en mètres
+    total_length_m = 0.0
+
+    for edge in circuit_edges:
+        # edge peut être (u, v) pour un Graph simple, ou (u, v, key) pour un MultiGraph
+        if len(edge) == 2:
+            u, v = edge
+            # plusieurs arêtes possibles entre u,v dans G_und, mais sur G_euler
+            # on suppose que la longueur 'length' est la même pour chaque duplication
+            data = G_und.get_edge_data(u, v)
+            # on prend la première arête existante
+            key0 = next(iter(data))
+            total_length_m += data[key0]['length']
+        else:
+            # cas MultiGraph : edge = (u, v, key)
+            u, v, k = edge
+            # on retrouve directement l’arête correspondante dans G_euler :
+            data_euler = G_euler.get_edge_data(u, v, k)
+            total_length_m += data_euler['length']
+
+    # 2) Conversion en kilomètres
+    total_distance_km = total_length_m / 1000.0
+
+    # 3) Calcul du coût
+    cost_fixed = 100.0         # 100 € fixe par jour
+    cost_per_km = 0.01         # 0.01 € par km
+    cost_variable = cost_per_km * total_distance_km
+    total_cost = cost_fixed + cost_variable
+
+    return total_distance_km, total_cost
 
 def main():
     # 1) Chargement / simplification / affichage initial
@@ -164,7 +202,11 @@ def main():
     # 3) Duplication & extraction du circuit
     G_euler = duplicate_edges(G_und, pairs)
     circuit_edges = extract_eulerian_circuit(G_euler)
-    print(f"Circuit eulérien généré : {len(circuit_edges)              } arêtes au total")
+    print(f"Circuit eulérien généré : {len(circuit_edges)} arêtes au total")
+
+    distance_km, cost = compute_survol_cost(G_und, G_euler, circuit_edges)
+    print(f"Distance totale à parcourir : {distance_km:.2f} km")
+    print(f"Coût total du survol : {cost:.2f} €")
 
     nodes_route = [circuit_edges[0][0]]
     for (u, v) in circuit_edges:
