@@ -53,70 +53,61 @@ def compute_pairwise_distances_euclid(G: nx.Graph,
                                       odd_nodes: list,
                                       batch_size: int = 500) -> dict:
     """
-    Calcule dist[(u, v)] = distance euclidienne (vol direct) entre chaque paire u<v
-    de odd_nodes, en utilisant des calculs vectorisés par blocs (batch) pour rester
-    en mémoire raisonnable.
+    Calcule dist[(u, v)] = distance euclidienne plane (CRS projeté) entre chaque paire u<v
+    de odd_nodes, en utilisant des calculs vectorisés par blocs (batch) pour rester en
+    mémoire raisonnable.
 
-    Retourne un dict dont les clefs sont des tuples (u,v) avec u<v, et les valeurs
-    la distance en mètres.
+    On projette d'abord G en CRS métrique (via ox.project_graph), puis on récupère x,y
+    en mètres.
+    Renvoie un dict {(u,v): distance_en_mètres} pour u<v.
     """
-    # 1) On extrait la position (y=lat, x=lon) de chaque odd_node dans deux vecteurs NumPy.
+    # 0) On projette le graphe en CRS métrique (UTM)
+    G_proj = ox.project_graph(G)
+
+    # 1) On récupère x,y de chaque odd_node (en mètres) dans deux tableaux NumPy
     M = len(odd_nodes)
-    lat = np.zeros(M, dtype=np.float64)
-    lon = np.zeros(M, dtype=np.float64)
+    xs = np.zeros(M, dtype=np.float64)
+    ys = np.zeros(M, dtype=np.float64)
     for i, n in enumerate(odd_nodes):
-        lat[i] = G.nodes[n]["y"]
-        lon[i] = G.nodes[n]["x"]
+        xs[i] = G_proj.nodes[n]["x"]
+        ys[i] = G_proj.nodes[n]["y"]
 
-    # Fonction Haversine vectorisée (opère sur arrays)
-    def haversine_vec(lat1, lon1, lat2, lon2):
-        """
-        Attendu : lat1, lon1, lat2, lon2 sont en radians (NumPy arrays) ;
-        renvoie la matrice des distances (en mètres).
-        """
-        R = 6371000.0  # rayon moyen de la Terre en m
-        dphi = lat2 - lat1[:, None]    # dim = (len(lat1), len(lat2))
-        dlambda = lon2 - lon1[:, None] # idem
-        a = np.sin(dphi / 2) ** 2 + np.cos(lat1[:, None]) * np.cos(lat2) * np.sin(dlambda / 2) ** 2
-        return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-
-    # 2) On convertit lat/lon en radians
-    lat_rad = np.radians(lat)
-    lon_rad = np.radians(lon)
-
-    dist = {}  # on va stocker dist[(u,v)] en mètres
-
-    # 3) On découpe les indices [0..M-1] en lots de taille batch_size
+    dist = {}
     n_batches = (M + batch_size - 1) // batch_size
+
     for bi in range(n_batches):
         i_start = bi * batch_size
         i_end = min(i_start + batch_size, M)
-        lat_i = lat_rad[i_start:i_end]
-        lon_i = lon_rad[i_start:i_end]
+        x_i = xs[i_start:i_end]
+        y_i = ys[i_start:i_end]
 
         for bj in range(bi, n_batches):
             j_start = bj * batch_size
             j_end = min(j_start + batch_size, M)
-            lat_j = lat_rad[j_start:j_end]
-            lon_j = lon_rad[j_start:j_end]
+            x_j = xs[j_start:j_end]
+            y_j = ys[j_start:j_end]
 
-            # 4) Calcul vectorisé des distances entre le bloc i et le bloc j
-            #    Si bi == bj, on calcule la matrice complète puis on ne garde que i<j
-            D = haversine_vec(lat_i, lon_i, lat_j, lon_j)
-            # D.shape = (i_end - i_start, j_end - j_start)
+            # Calcul de la distance euclidienne en vectorisé
+            # : pour chaque i dans [i_start,i_end), j dans [j_start,j_end),
+            #   d = sqrt((x_i[i - i_start] - x_j[j - j_start])^2 + (y_i[...] - y_j[...])^2)
+            # On utilise broadcasting pour obtenir une matrice de shape ((i_end - i_start),(j_end - j_start)).
+            dx = x_i[:, None] - x_j[None, :]
+            dy = y_i[:, None] - y_j[None, :]
+            D = np.hypot(dx, dy)  # D[ii,jj] = sqrt(dx[ii,jj]^2 + dy[ii,jj]^2)
 
+            # On copie dans le dict seulement les paires u<v
             for ii in range(i_end - i_start):
                 u = odd_nodes[i_start + ii]
-                # si bi == bj, on ne prend que j > i
                 if bi == bj:
+                    # Cas où l'on compare le même lot → on garde seulement j>i
                     for jj in range(ii + 1, j_end - j_start):
                         v = odd_nodes[j_start + jj]
                         dist[(u, v)] = float(D[ii, jj])
                 else:
+                    # Cas bi < bj → tout j de ce lot est > i
                     for jj in range(j_end - j_start):
                         u_idx = i_start + ii
                         v_idx = j_start + jj
-                        # toujours u_idx < v_idx parce que bi < bj
                         uu = odd_nodes[u_idx]
                         vv = odd_nodes[v_idx]
                         dist[(uu, vv)] = float(D[ii, jj])
@@ -211,58 +202,58 @@ def main():
     plot_graph(G_und, show=False, savepath="montreal_simplified.png")
 
     # 2) Longueur totale de toutes les arêtes
-    total_length_m = sum(
-        data.get("length", 0.0) for _, _, data in G_und.edges(data=True)
-    )
+    total_length_m = sum(data["length"] for _, _, data in G_und.edges(data=True))
     total_length_km = total_length_m / 1000.0
     print(f"Longueur totale de toutes les arêtes : {total_length_km:.2f} km")
 
-    # 3) Sommet impairs
+    # 3) Sommets impairs
     odd = [n for n, d in G_und.degree() if d % 2 == 1]
     print(f"{len(odd)} sommets impairs")
 
-    # 4) Distances euclidiennes (vol direct) en mode batch
-    print("-- computing euclidean distances batch --")
+    # 4) Distances planaires (projection + batch)
+    print("-- computing planar (projected) distances batch --")
     dist = compute_pairwise_distances_euclid(G_und, odd, batch_size=500)
-    print("Distances directes calculées")
+    print("Distances planaires calculées")
 
     # 5) Matching minimal
     pairs = minimum_weight_matching(odd, dist)
     print(f"{len(pairs)} paires optimales calculées")
 
-    # 6) Dupliquer une arête directe par paire
+    # 6) Longueur moyenne des arêtes ajoutées
+    lengths_added = []
+    for u, v in pairs:
+        if (u, v) in dist:
+            lengths_added.append(dist[(u, v)])
+        else:
+            lengths_added.append(dist[(v, u)])
+    avg_length_m = sum(lengths_added) / len(lengths_added)
+    print(f"Longueur moyenne des arêtes ajoutées : {avg_length_m:.2f} m ({avg_length_m/1000:.2f} km)")
+
+    # 7) Dupliquer une arête directe par paire
     G_euler = duplicate_edges_direct(G_und, pairs, dist)
     print(f"Graphe eulérien créé : {len(G_euler.nodes)} nœuds, {G_euler.number_of_edges()} arêtes")
 
-    # 7) Extraction du chemin eulérien
+    # 8) Extraction du chemin eulérien
     path_edges = extract_eulerian_path(G_euler)
     print(f"Chemin eulérien extrait : {len(path_edges)} arêtes au total")
 
-    # 8) Coût du survol
+    # 9) Calcul du coût du survol
     distance_km, cost = compute_survol_cost(G_und, G_euler, path_edges)
     print(f"Distance totale à parcourir : {distance_km:.2f} km")
     print(f"Coût total du survol : {cost:.2f} €")
 
-    # 9) Préparer la liste de nœuds pour tracer
+    # 10) Préparer la liste de nœuds pour tracer
     nodes_route = [path_edges[0][0]]
     for edge in path_edges:
         nodes_route.append(edge[1])
 
-    # 10) Affichage du chemin eulérien sur le graphe
+    # 11) Affichage du chemin eulérien sur le fond de carte
     print("-- plotting eulerian path --")
-    # a) On trace d’abord le graphe simplifié en fond
     fig, ax = ox.plot_graph(G_und, show=False, close=False)
-
-    # b) On récupère les coordonnées x,y de chaque nœud dans l’ordre du chemin
     xs = [G_und.nodes[n]["x"] for n in nodes_route]
     ys = [G_und.nodes[n]["y"] for n in nodes_route]
-
-    # c) On superpose le tracé : on relie chaque paire (n_i → n_{i+1}) par une ligne droite
     ax.plot(xs, ys, linewidth=2, color="r")
-
-    # d) Affichage final
     plt.show()
-
 
 if __name__ == "__main__":
     main()
