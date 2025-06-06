@@ -2,6 +2,7 @@ import sys
 import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
+from shapely.geometry import LineString
 
 # -----------------------------------------------
 # Liste des quartiers
@@ -52,7 +53,7 @@ def cost_per_machine(type_, max_hours):
 def find_best_mixed_fleet(total_distance_km, max_hours, max_vehicles=10):
     """
     Cherche (nI, nII) ≤ max_vehicles pour couvrir total_distance_km
-    avec des machines de capacité respectives cap_I et cap_II,
+    avec des machines de capacité respective cap_I et cap_II,
     et minimise le coût total.
     Renvoie (best_cost, best_nI, best_nII) ou (None, None, None) si impossible.
     """
@@ -80,7 +81,7 @@ def find_best_mixed_fleet(total_distance_km, max_hours, max_vehicles=10):
 
 
 # -----------------------------------------------
-# 3) Construction du circuit eulérien + découpage
+# 3) Construction du circuit eulérien + découpage séquentiel
 # -----------------------------------------------
 def build_eulerian_routes(G, nI, nII, max_hours):
     """
@@ -88,43 +89,62 @@ def build_eulerian_routes(G, nI, nII, max_hours):
      1) le convertit en MultiGraph non orienté U = G.to_undirected()
      2) le rend eulérien (nx.eulerize)
      3) récupère le circuit eulérien (liste d'arêtes successives)
-     4) découpe ce circuit en nI itinéraires Type I et nII itinéraires Type II,
-        chacun conforme à sa capacité (10*max_hours pour Type I, 20*max_hours pour Type II).
+     4) découpe ce circuit **séquentiellement** :
+        – on affecte d'abord aux nI machines de type I environ (10*max_hours) km chacune
+        – puis aux nII machines de type II environ (20*max_hours) km chacune
+       afin que chaque segment du circuit soit utilisé exactement une fois.
     Renvoie deux listes : routes_I (nI listes d'arêtes), routes_II (nII listes d'arêtes).
     """
-    # Convertir en non orienté
+    # 3.1) Construire U = graphe non orienté, puis euleriser
     U = G.to_undirected()
-    # Eulerisation (sans argument weight) pour rendre U eulérien
-    M = nx.eulerize(U)
+    M = nx.eulerize(U)  # sans argument weight
 
-    # Calcul du circuit eulérien (séquence d'arêtes (u, v))
+    # 3.2) Récupérer la liste d'arêtes du circuit eulérien
     start = next(iter(M.nodes()))
     circuit = list(nx.eulerian_circuit(M, source=start))
+    # circuit est une liste [(u0, v0), (u1, v1), ...], couvrant chaque arête (duplications incluses).
 
-    cap_I = 10.0 * max_hours  # km max pour une machine Type I
-    cap_II = 20.0 * max_hours  # km max pour une machine Type II
+    # 3.3) Définir les capacités en km de chaque type
+    cap_I = 10.0 * max_hours  # Type I → 10 km/h * max_hours
+    cap_II = 20.0 * max_hours  # Type II → 20 km/h * max_hours
 
-    def découpe(circuit, cap, nmach):
-        """
-        Découpe la liste d'arêtes 'circuit' en 'nmach' sous-listes,
-        chaque sous-liste ne dépassant pas 'cap' km cumulés (en sommant U[u][v][0]['length'] / 1000).
-        """
-        if nmach == 0:
-            return []
-        listes = [[] for _ in range(nmach)]
-        idx = 0
+    # 3.4) On va consommer le circuit dans l'ordre, d'abord pour Type I, puis pour Type II
+    routes_I = []
+    routes_II = []
+
+    idx = 0  # position courante dans "circuit"
+    n_edges = len(circuit)
+
+    # Fonction auxiliaire pour attribuer à une machine (Type I ou II) jusqu'à sa capacité
+    def attribue_par_machine(capacité):
+        nonlocal idx
+        itinéraire = []
         accu = 0.0
-        for u, v in circuit:
+        # On parcourt les arêtes du circuit à partir d'idx
+        while idx < n_edges:
+            u, v = circuit[idx]
             longueur_km = U[u][v][0]["length"] / 1000.0
-            if accu + longueur_km > cap and idx + 1 < nmach:
-                idx += 1
-                accu = 0.0
-            listes[idx].append((u, v))
+            if accu + longueur_km > capacité:
+                break
+            itinéraire.append((u, v))
             accu += longueur_km
-        return listes
+            idx += 1
+        return itinéraire
 
-    routes_I = découpe(circuit, cap_I, nI)
-    routes_II = découpe(circuit, cap_II, nII)
+    # 3.4.1) Donner aux nI machines de type I (capacité cap_I chacune)
+    for _ in range(nI):
+        route_I = attribue_par_machine(cap_I)
+        routes_I.append(route_I)
+
+    # 3.4.2) Ensuite, donner aux nII machines de type II (capacité cap_II chacune)
+    for _ in range(nII):
+        route_II = attribue_par_machine(cap_II)
+        routes_II.append(route_II)
+
+    # Note : Si idx < n_edges après avoir attribué I et II, cela signifie
+    # que la somme des capacités est inférieure à la longueur totale du circuit.
+    # Or par construction de find_best_mixed_fleet, la capacité totale ≥ distance réseau.
+    # Donc, on doit toujours consommer tout le circuit avant d'arriver aux machines finales.
     return routes_I, routes_II
 
 
@@ -137,17 +157,15 @@ def plot_network_and_route_with_time(G, route_edges, type_machine, title):
     donné sous forme de route_edges = [(u,v), ...] en couleur selon type_machine.
     Affiche en console la distance totale et le temps nécessaire.
     """
-    U = (
-        G.to_undirected()
-    )  # MultiGraph non orienté, conserve 'length' et éventuellement 'geometry'
+    U = G.to_undirected()
 
-    # 1) Calculer la distance totale de cette route (en km)
+    # 4.1) Calculer la distance totale de cette route (en km)
     total_dist_km = 0.0
     for u, v in route_edges:
         longueur_m = U[u][v][0]["length"]
         total_dist_km += longueur_m / 1000.0
 
-    # 2) Déterminer la vitesse selon le type (I = 10 km/h, II = 20 km/h) et calculer le temps
+    # 4.2) Déterminer la vitesse selon le type (I = 10 km/h, II = 20 km/h)
     if type_machine == "I":
         speed = 10.0
         color = "blue"
@@ -156,13 +174,13 @@ def plot_network_and_route_with_time(G, route_edges, type_machine, title):
         color = "red"
     time_hours = total_dist_km / speed
 
-    # 3) Afficher en console
+    # 4.3) Afficher en console
     print(
         f"    • Distance de l'itinéraire Type {type_machine} : {total_dist_km:.2f} km"
     )
     print(f"      → Temps estimé à {speed:.0f} km/h : {time_hours:.2f} heures\n")
 
-    # 4) Dessiner le fond : toutes les arêtes du réseau en gris léger
+    # 4.4) Tracer l’arrière-plan (toutes les arêtes du réseau en gris clair)
     fig, ax = plt.subplots(figsize=(8, 8))
     for u, v, data in U.edges(data=True):
         if "geometry" in data:
@@ -173,17 +191,16 @@ def plot_network_and_route_with_time(G, route_edges, type_machine, title):
             x2, y2 = U.nodes[v]["x"], U.nodes[v]["y"]
             ax.plot([x1, x2], [y1, y2], linewidth=0.4, color="lightgray", zorder=1)
 
-    # 5) Dessiner la route de la machine en surcouche
+    # 4.5) Tracer l’itinéraire de la machine en surcouche
     for u, v in route_edges:
         data = U.get_edge_data(u, v)
         if data is None:
-            # si l'arête n'existe pas tel quel (rare), on trace un segment direct
+            # si l'arête n'existe pas (rare), tracer un segment direct
             x1, y1 = U.nodes[u]["x"], U.nodes[u]["y"]
             x2, y2 = U.nodes[v]["x"], U.nodes[v]["y"]
             ax.plot([x1, x2], [y1, y2], linewidth=1.8, color=color, zorder=2)
         else:
-            # On prend la première variante si arêtes multiples
-            attrib = data[0]
+            attrib = data[0]  # choisir la première arête s’il y en a plusieurs
             if "geometry" in attrib:
                 xs, ys = attrib["geometry"].xy
                 ax.plot(xs, ys, linewidth=1.8, color=color, zorder=2)
@@ -202,7 +219,7 @@ def plot_network_and_route_with_time(G, route_edges, type_machine, title):
 # 5) Fonction principale
 # -----------------------------------------------
 def main():
-    # Lecture du temps max (défaut 20h)
+    # Lecture du temps max (défaut 20 h)
     if len(sys.argv) >= 2:
         try:
             max_hours = float(sys.argv[1])
@@ -220,17 +237,17 @@ def main():
             # 1) Télécharger le graphe routier
             G = ox.graph_from_place(name, network_type="drive")
 
-            # 2) Calculer la distance totale
+            # 2) Calculer la distance totale du réseau (en km)
             total_m = sum(d.get("length", 0) for u, v, d in G.edges(data=True))
             total_km = total_m / 1000.0
 
-            # 3) Trouver la flotte optimale
+            # 3) Trouver la flotte optimale et son coût
             best_cost, best_nI, best_nII = find_best_mixed_fleet(
                 total_km, max_hours, max_vehicles=10
             )
             if best_nI is None:
                 print(
-                    f"  ❌ Impossible de couvrir {total_km:.2f} km avec ≤ 10 machines en {max_hours:.1f}h.\n"
+                    f"  ❌ Impossible de couvrir {total_km:.2f} km avec ≤10 machines en {max_hours:.1f} h.\n"
                 )
                 continue
 
@@ -240,10 +257,10 @@ def main():
             )
             print(f"    Coût global estimé = {best_cost:.2f} $\n")
 
-            # 4) Générer les itinéraires
+            # 4) Générer les itinéraires (découpage séquentiel)
             routes_I, routes_II = build_eulerian_routes(G, best_nI, best_nII, max_hours)
 
-            # 5) Pour chaque machine Type I, afficher distance et temps, puis tracer
+            # 5) Pour chaque machine Type I, afficher distance/temps, puis tracer
             if best_nI > 0:
                 for idx, r in enumerate(routes_I, start=1):
                     print(f"  ── Machine I#{idx} ──")
@@ -254,7 +271,7 @@ def main():
                         title=f"Itinéraire Machine I#{idx} → {name}",
                     )
 
-            # 6) Pour chaque machine Type II, afficher distance et temps, puis tracer
+            # 6) Pour chaque machine Type II, afficher distance/temps, puis tracer
             if best_nII > 0:
                 for idx, r in enumerate(routes_II, start=1):
                     print(f"  ── Machine II#{idx} ──")
