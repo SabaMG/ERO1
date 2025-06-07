@@ -1,258 +1,222 @@
-import osmnx as ox
 import os
+import time
+import osmnx as ox
 import networkx as nx
 import rustworkx as rx
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.cluster import KMeans
 
-#PLACE_NAME = "Montréal, Québec, Canada"
-PLACE_NAME = "Outremont, Montreal, Canada"
-#DIRECTED_FILE = "montreal_directed.graphml"
-DIRECTED_FILE = "outremont_directed.graphml"
-UNDIRECTED_FILE = "outremont_undirected.graphml"
-#UNDIRECTED_FILE = "montreal_undirected.graphml"
+PLACE_NAME = "Montréal, Québec, Canada"
+DIRECTED_FILE = "montreal_directed.graphml"
+UNDIRECTED_FILE = "montreal_undirected.graphml"
+NUM_DRONES = 4
+BATCH_SIZE = 500
+COST_FIXED = 100.0    # € / jour
+COST_PER_KM = 0.01    # €/km
+DRONE_SPEED = 50 # km/h
 
-
+# --------------------------------------------------------------------------
+# 1) CHARGEMENT DU GRAPHE
+# --------------------------------------------------------------------------
 def load_and_simplify(place_name: str) -> nx.Graph:
-    """
-    Charge le graphe non orienté depuis fichier s'il existe,
-    sinon le télécharge, sauvegarde directed + undirected, et le retourne.
-    """
     if os.path.exists(UNDIRECTED_FILE):
         print(f"⇨ Chargement du graphe non orienté depuis {UNDIRECTED_FILE}")
         return ox.load_graphml(UNDIRECTED_FILE)
-
     if os.path.exists(DIRECTED_FILE):
         print(f"⇨ Chargement du graphe orienté depuis {DIRECTED_FILE}")
         G = ox.load_graphml(DIRECTED_FILE)
     else:
         print("⇨ Téléchargement du graphe via OSMnx")
         G = ox.graph_from_place(place_name, network_type="drive")
-        print(f"⇨ Sauvegarde du graphe orienté dans {DIRECTED_FILE}")
         ox.save_graphml(G, filepath=DIRECTED_FILE)
-
     G_und = G.to_undirected()
     print(f"⇨ Sauvegarde du graphe non orienté dans {UNDIRECTED_FILE}")
     ox.save_graphml(G_und, filepath=UNDIRECTED_FILE)
     return G_und
 
-
-def plot_graph(G: nx.Graph, show: bool = True, savepath: str = None):
-    """
-    Trace le graphe avec OSMnx + Matplotlib.
-    """
-    fig, ax = ox.plot_graph(G, show=False, close=False)
-    if savepath:
-        fig.savefig(savepath, dpi=300, bbox_inches="tight")
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def compute_pairwise_distances_euclid(G: nx.Graph,
-                                      odd_nodes: list,
-                                      batch_size: int = 500) -> dict:
-    """
-    Calcule dist[(u, v)] = distance euclidienne plane (CRS projeté) entre chaque paire u<v
-    de odd_nodes, en utilisant des calculs vectorisés par blocs (batch) pour rester en
-    mémoire raisonnable.
-
-    On projette d'abord G en CRS métrique (via ox.project_graph), puis on récupère x,y
-    en mètres.
-    Renvoie un dict {(u,v): distance_en_mètres} pour u<v.
-    """
-    # 0) On projette le graphe en CRS métrique (UTM)
+# --------------------------------------------------------------------------
+# 2) PARTITION SPATIALE DU GRAPHE
+# --------------------------------------------------------------------------
+def partition_graph(G: nx.Graph, num_clusters: int):
     G_proj = ox.project_graph(G)
+    nodes = list(G_proj.nodes)
+    coords = np.array([[G_proj.nodes[n]['x'], G_proj.nodes[n]['y']] for n in nodes])
+    labels = KMeans(n_clusters=num_clusters, random_state=0).fit_predict(coords)
+    subgraphs = []
+    for k in range(num_clusters):
+        nodes_k = [nodes[i] for i, lab in enumerate(labels) if lab == k]
+        subgraphs.append(G.subgraph(nodes_k).copy())
+    return subgraphs
 
-    # 1) On récupère x,y de chaque odd_node (en mètres) dans deux tableaux NumPy
+# --------------------------------------------------------------------------
+# 3) DISTANCES EUCLIDIENNES BATCH
+# --------------------------------------------------------------------------
+def compute_pairwise_distances_euclid(G: nx.Graph, odd_nodes: list, batch_size: int = BATCH_SIZE) -> dict:
+    G_proj = ox.project_graph(G)
     M = len(odd_nodes)
-    xs = np.zeros(M, dtype=np.float64)
-    ys = np.zeros(M, dtype=np.float64)
+    xs = np.zeros(M)
+    ys = np.zeros(M)
     for i, n in enumerate(odd_nodes):
-        xs[i] = G_proj.nodes[n]["x"]
-        ys[i] = G_proj.nodes[n]["y"]
-
+        xs[i] = G_proj.nodes[n]['x']
+        ys[i] = G_proj.nodes[n]['y']
     dist = {}
     n_batches = (M + batch_size - 1) // batch_size
-
     for bi in range(n_batches):
-        i_start = bi * batch_size
-        i_end = min(i_start + batch_size, M)
-        x_i = xs[i_start:i_end]
-        y_i = ys[i_start:i_end]
-
+        i0 = bi * batch_size
+        i1 = min(i0 + batch_size, M)
+        xi, yi = xs[i0:i1], ys[i0:i1]
         for bj in range(bi, n_batches):
-            j_start = bj * batch_size
-            j_end = min(j_start + batch_size, M)
-            x_j = xs[j_start:j_end]
-            y_j = ys[j_start:j_end]
-
-            # Calcul de la distance euclidienne en vectorisé
-            # : pour chaque i dans [i_start,i_end), j dans [j_start,j_end),
-            #   d = sqrt((x_i[i - i_start] - x_j[j - j_start])^2 + (y_i[...] - y_j[...])^2)
-            # On utilise broadcasting pour obtenir une matrice de shape ((i_end - i_start),(j_end - j_start)).
-            dx = x_i[:, None] - x_j[None, :]
-            dy = y_i[:, None] - y_j[None, :]
-            D = np.hypot(dx, dy)  # D[ii,jj] = sqrt(dx[ii,jj]^2 + dy[ii,jj]^2)
-
-            # On copie dans le dict seulement les paires u<v
-            for ii in range(i_end - i_start):
-                u = odd_nodes[i_start + ii]
+            j0 = bj * batch_size
+            j1 = min(j0 + batch_size, M)
+            xj, yj = xs[j0:j1], ys[j0:j1]
+            dx = xi[:, None] - xj[None, :]
+            dy = yi[:, None] - yj[None, :]
+            D = np.hypot(dx, dy)
+            for ii in range(i1 - i0):
+                u = odd_nodes[i0 + ii]
                 if bi == bj:
-                    # Cas où l'on compare le même lot → on garde seulement j>i
-                    for jj in range(ii + 1, j_end - j_start):
-                        v = odd_nodes[j_start + jj]
-                        dist[(u, v)] = float(D[ii, jj])
+                    for jj in range(ii + 1, j1 - j0):
+                        v = odd_nodes[j0 + jj]
+                        dist[(u, v)] = float(D[ii, jj])/10.0
                 else:
-                    # Cas bi < bj → tout j de ce lot est > i
-                    for jj in range(j_end - j_start):
-                        u_idx = i_start + ii
-                        v_idx = j_start + jj
-                        uu = odd_nodes[u_idx]
-                        vv = odd_nodes[v_idx]
-                        dist[(uu, vv)] = float(D[ii, jj])
-
+                    for jj in range(j1 - j0):
+                        uu = odd_nodes[i0 + ii]
+                        vv = odd_nodes[j0 + jj]
+                        dist[(uu, vv)] = float(D[ii, jj])/10.0
         print(f"batch {bi+1}/{n_batches} done")
-
     return dist
 
-
+# --------------------------------------------------------------------------
+# 4) MATCHING BLOSSOM
+# --------------------------------------------------------------------------
 def minimum_weight_matching(odd_nodes: list, dist: dict) -> list:
-    """
-    Sur le graphe complet K d'impairs, trouve l'appariement
-    parfait de poids minimal via retworkx (max_weight sur -poids).
-    """
     m = len(odd_nodes)
     g = rx.PyGraph()
-    g.add_nodes_from(list(range(m)))
-
+    g.add_nodes_from(range(m))
     for i in range(m):
-        for j in range(i + 1, m):
-            u, v = odd_nodes[i], odd_nodes[j]
-            w = dist[(u, v)]
-            g.add_edge(i, j, -w)
-
+        for j in range(i+1, m):
+            w = dist[(odd_nodes[i], odd_nodes[j])]
+            g.add_edge(i, j, w)
     matching = rx.max_weight_matching(g)
     return [(odd_nodes[i], odd_nodes[j]) for i, j in matching]
 
-
+# --------------------------------------------------------------------------
+# 5) DUPLICATION DES ARÊTES DIRECTES
+# --------------------------------------------------------------------------
 def duplicate_edges_direct(G: nx.Graph, pairs: list, dist: dict) -> nx.MultiGraph:
-    """
-    Duplique dans un MultiGraph une SEULE arête directe (vol) entre u et v
-    pour chaque paire issue du matching. La longueur de cette arête est donnée
-    par dist[(u,v)] ou dist[(v,u)] (distance euclidienne).
-    """
     G_euler = nx.MultiGraph(G)
     for u, v in pairs:
-        # On cherche la distance en imposant l'ordre (u < v) dans le dict
-        if (u, v) in dist:
-            length_uv = dist[(u, v)]
-        else:
-            length_uv = dist[(v, u)]
-        # Ajouter une seule arête directe entre u et v, avec le poids "length"
+        length_uv = dist.get((u, v), dist.get((v, u)))
         G_euler.add_edge(u, v, length=length_uv)
     return G_euler
 
-
+# --------------------------------------------------------------------------
+# 6) EXTRACTION DU CHEMIN EULÉRIEN
+# --------------------------------------------------------------------------
 def extract_eulerian_path(G_euler: nx.MultiGraph) -> list:
-    """
-    Renvoie la liste des arêtes (u, v, key) dans l'ordre du chemin eulérien.
-    """
-    assert nx.is_eulerian(G_euler), "Le graphe n'est pas eulérien !"
+    #assert nx.is_eulerian(G_euler), "Le graphe n'est pas eulérien !"
     return list(nx.eulerian_path(G_euler))
 
-
-def compute_survol_cost(G_und: nx.Graph, G_euler: nx.MultiGraph, path_edges: list):
-    """
-    G_und : graphe routier original (pour récupérer length de toute arête existante).
-    G_euler : MultiGraph eulérien contenant duplications directes.
-    path_edges : liste retournée par nx.eulerian_path(G_euler).
-    """
-    total_length_m = 0.0
+# --------------------------------------------------------------------------
+# 7) CALCUL DU COÛT
+# --------------------------------------------------------------------------
+def compute_survol_cost(G_und, G_euler, path_edges):
+    total_m = 0.0
     for edge in path_edges:
-        # edge = (u, v) ou (u, v, key)
         if len(edge) == 2:
             u, v = edge
             if G_und.has_edge(u, v):
                 data = G_und.get_edge_data(u, v)
-                key0 = next(iter(data))
-                total_length_m += data[key0]["length"]
+                total_m += data[next(iter(data))]['length']
             else:
-                data_euler = G_euler.get_edge_data(u, v)
-                key0 = next(iter(data_euler))
-                total_length_m += data_euler[key0]["length"]
+                data = G_euler.get_edge_data(u, v)
+                total_m += data[next(iter(data))]['length']
         else:
             u, v, k = edge
-            data_euler = G_euler.get_edge_data(u, v, k)
-            total_length_m += data_euler["length"]
+            total_m += G_euler.get_edge_data(u, v, k)['length']
+    km = total_m / 1000.0
+    cost = COST_FIXED + COST_PER_KM * km
+    return km, cost
 
-    total_distance_km = total_length_m / 1000.0
-    cost_fixed = 100.0
-    cost_per_km = 0.01
-    cost_variable = cost_per_km * total_distance_km
-    total_cost = cost_fixed + cost_variable
-    return total_distance_km, total_cost
+def connect_components(sub: nx.Graph) -> None:
+    # projeté pour coords métriques
+    Gp = ox.project_graph(sub)
+    comps = list(nx.connected_components(sub))
+    # pour chaque paire de composantes consécutives trouver plus proches
+    for k in range(len(comps)-1):
+        A, B = comps[k], comps[k+1]
+        best = None
+        best_dist = float('inf')
+        for u in A:
+            x_u, y_u = Gp.nodes[u]['x'], Gp.nodes[u]['y']
+            for v in B:
+                x_v, y_v = Gp.nodes[v]['x'], Gp.nodes[v]['y']
+                d = ((x_u-x_v)**2 + (y_u-y_v)**2)**0.5
+                if d < best_dist:
+                    best_dist, best = (d, (u, v))
+        u, v = best
+        sub.add_edge(u, v, length=best_dist)
 
-
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
 def main():
-    # 1) Chargement / simplification
-    print("--- load and simplify ---")
     G_und = load_and_simplify(PLACE_NAME)
     print(f"Graph chargé : {len(G_und.nodes)} nœuds, {len(G_und.edges)} arêtes")
-    plot_graph(G_und, show=False, savepath="montreal_simplified.png")
+    subgraphs = partition_graph(G_und, NUM_DRONES)
+    # préparer le fond projeté et la colormap
+    G_proj = ox.project_graph(G_und)
+    fig, ax = ox.plot_graph(G_proj, show=False, close=False)
+    cmap = plt.cm.get_cmap('tab10', NUM_DRONES)
 
-    # 2) Longueur totale de toutes les arêtes
-    total_length_m = sum(data["length"] for _, _, data in G_und.edges(data=True))
-    total_length_km = total_length_m / 1000.0
-    print(f"Longueur totale de toutes les arêtes : {total_length_km:.2f} km")
+    dists = []
+    total_compute_time = 0
+    total_km = 0.0
+    total_cost = 0.0
+    for i, sub in enumerate(subgraphs):
+        print(f"\n--- Drone {i+1}/{NUM_DRONES} sur {len(sub.nodes)} nœuds ---")
+        start_time = time.time()
 
-    # 3) Sommets impairs
-    odd = [n for n, d in G_und.degree() if d % 2 == 1]
-    print(f"{len(odd)} sommets impairs")
+        n_comp = nx.number_connected_components(sub)
+        connect_components(sub)
+        print("Connected subgraph components")
+        odd = [n for n, d in sub.degree() if d % 2 == 1]
+        print(f"Sommets impairs: {len(odd)}")
+        if sub.number_of_nodes() < 2:
+            print(" trop petit, skip.")
+            continue
+        print("Computing distances...")
+        dist = compute_pairwise_distances_euclid(sub, odd)
+        print("Minimum weight matching...")
+        pairs = minimum_weight_matching(odd, dist)
+        print(f"Paires appariées: {len(pairs)}")
+        G_euler = duplicate_edges_direct(sub, pairs, dist)
+        path = extract_eulerian_path(G_euler)
 
-    # 4) Distances planaires (projection + batch)
-    print("-- computing planar (projected) distances batch --")
-    dist = compute_pairwise_distances_euclid(G_und, odd, batch_size=500)
-    print("Distances planaires calculées")
+        elapsed = time.time() - start_time
+        total_compute_time += elapsed
+        print(f"Temps de calcul itinéraire drone {i+1}: {elapsed:.2f}s")
 
-    # 5) Matching minimal
-    pairs = minimum_weight_matching(odd, dist)
-    print(f"{len(pairs)} paires optimales calculées")
+        km, cost = compute_survol_cost(sub, G_euler, path)
+        dists.append(km)
+        total_km += km
+        total_cost += cost
+        print(f"Distance circuit: {km:.2f} km, coût: {cost:.2f} €")
 
-    # 6) Longueur moyenne des arêtes ajoutées
-    lengths_added = []
-    for u, v in pairs:
-        if (u, v) in dist:
-            lengths_added.append(dist[(u, v)])
-        else:
-            lengths_added.append(dist[(v, u)])
-    avg_length_m = sum(lengths_added) / len(lengths_added)
-    print(f"Longueur moyenne des arêtes ajoutées : {avg_length_m:.2f} m ({avg_length_m/1000:.2f} km)")
+        nodes_route = [path[0][0]] + [e[1] for e in path]
+        xs = [G_proj.nodes[n]['x'] for n in nodes_route]
+        ys = [G_proj.nodes[n]['y'] for n in nodes_route]
+        ax.plot(xs, ys, linewidth=1.0, color=cmap(i), label=f"Drone {i+1}")
 
-    # 7) Dupliquer une arête directe par paire
-    G_euler = duplicate_edges_direct(G_und, pairs, dist)
-    print(f"Graphe eulérien créé : {len(G_euler.nodes)} nœuds, {G_euler.number_of_edges()} arêtes")
+    print(f"\n=== Résumé global ===")
+    print(f"Distance totale (tous drones) : {total_km:.2f} km")
+    print(f"Coût total (tous drones) : {total_cost:.2f} €")
 
-    # 8) Extraction du chemin eulérien
-    path_edges = extract_eulerian_path(G_euler)
-    print(f"Chemin eulérien extrait : {len(path_edges)} arêtes au total")
-
-    # 9) Calcul du coût du survol
-    distance_km, cost = compute_survol_cost(G_und, G_euler, path_edges)
-    print(f"Distance totale à parcourir : {distance_km:.2f} km")
-    print(f"Coût total du survol : {cost:.2f} €")
-
-    # 10) Préparer la liste de nœuds pour tracer
-    nodes_route = [path_edges[0][0]]
-    for edge in path_edges:
-        nodes_route.append(edge[1])
-
-    # 11) Affichage du chemin eulérien sur le fond de carte
-    print("-- plotting eulerian path --")
-    fig, ax = ox.plot_graph(G_und, show=False, close=False)
-    xs = [G_und.nodes[n]["x"] for n in nodes_route]
-    ys = [G_und.nodes[n]["y"] for n in nodes_route]
-    ax.plot(xs, ys, linewidth=2, color="r")
+    travel_time = max(dists) / DRONE_SPEED
+    print(f"Temps de reconnaissance pour un drone allant à {DRONE_SPEED}km/h : {travel_time:.2f}h ")
+    print(f"Temps de calcul total {total_compute_time:.2f}s")
+    ax.legend()
     plt.show()
 
 if __name__ == "__main__":
