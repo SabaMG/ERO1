@@ -53,12 +53,10 @@ def compute_pairwise_distances_euclid(G: nx.Graph,
                                       odd_nodes: list,
                                       batch_size: int = 500) -> dict:
     """
-    Calcule dist[(u, v)] = distance euclidienne plane (CRS projeté) entre chaque paire u<v
-    de odd_nodes, en utilisant des calculs vectorisés par blocs (batch) pour rester en
-    mémoire raisonnable.
+    Calcule dist[(u, v)] = distance euclidienne plane entre chaque paire u<v
+    de odd_nodes, en utilisant des calculs vectorisés par batch.
 
-    On projette d'abord G en CRS métrique (via ox.project_graph), puis on récupère x,y
-    en mètres.
+    On projette G, puis on récupère x,y
     Renvoie un dict {(u,v): distance_en_mètres} pour u<v.
     """
     # 0) On projette le graphe en CRS métrique (UTM)
@@ -102,7 +100,7 @@ def compute_pairwise_distances_euclid(G: nx.Graph,
                     # Cas où l'on compare le même lot → on garde seulement j>i
                     for jj in range(ii + 1, j_end - j_start):
                         v = odd_nodes[j_start + jj]
-                        dist[(u, v)] = float(D[ii, jj])
+                        dist[(u, v)] = float(D[ii, jj])/10.0
                 else:
                     # Cas bi < bj → tout j de ce lot est > i
                     for jj in range(j_end - j_start):
@@ -110,7 +108,7 @@ def compute_pairwise_distances_euclid(G: nx.Graph,
                         v_idx = j_start + jj
                         uu = odd_nodes[u_idx]
                         vv = odd_nodes[v_idx]
-                        dist[(uu, vv)] = float(D[ii, jj])
+                        dist[(uu, vv)] = float(D[ii, jj])/10.0
 
         print(f"batch {bi+1}/{n_batches} done")
 
